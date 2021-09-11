@@ -49,8 +49,8 @@ pub mod pallet {
 
 	// We are fetching information from the github public API about organization`substrate-developer-hub`.
 	const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
+	const HTTP_POLKADOT_REQUEST: &str = "https://api.coincap.io/v2/assets/polkadot";
 	const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
-	//const HTTP_POLKADOT_REQUEST: &str = "";
 
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 	const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
@@ -107,6 +107,16 @@ pub mod pallet {
 		blog: Vec<u8>,
 		public_repos: u32,
 	}
+	
+	struct PriceTmp{
+
+	}
+	#[derive(Deserialize, Encode, Decode, Default)]
+	struct PriceInfo {
+		#[serde(deserialize_with = "de_string_to_bytes")]
+		priceUsd: Vec<u8>,
+		
+	}
 
 	#[derive(Debug, Deserialize, Encode, Decode, Default)]
 	struct IndexingData(Vec<u8>, u64);
@@ -117,6 +127,18 @@ pub mod pallet {
 	{
 		let s: &str = Deserialize::deserialize(de)?;
 		Ok(s.as_bytes().to_vec())
+	}
+	impl fmt::Debug for PriceInfo {
+		// `fmt` converts the vector of bytes inside the struct back to string for
+		//   more friendly display.
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+			write!(
+				f,
+				"{{ priceUsedL: {} }}",
+				str::from_utf8(&self.priceUsd).map_err(|_| fmt::Error)?,
+				
+				)
+		}
 	}
 
 	impl fmt::Debug for GithubInfo {
@@ -163,6 +185,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		NewNumber(Option<T::AccountId>, u64),
+		NewPrice(Option<T::AccountId>, (u64, Permill)),
 	}
 
 	// Errors inform users that something went wrong.
@@ -266,6 +289,16 @@ pub mod pallet {
 		}
 
 		#[pallet::weight(10000)]
+		pub fn submit_price_signed(origin: OriginFor<T>, price: (u64, Permill))-> DispatchResult {
+			let who = ensure_signed(origin)?;
+			log::info!("submit_price_signed: ({:?}, {:?})", price, who);
+			Self::append_or_replace_price(price);
+			
+			Self::deposit_event(Event::NewPrice(Some(who), price));
+			Ok(())
+		}
+
+		#[pallet::weight(10000)]
 		pub fn submit_number_unsigned(origin: OriginFor<T>, number: u64) -> DispatchResult {
 			let _ = ensure_none(origin)?;
 			log::info!("submit_number_unsigned: {}", number);
@@ -304,9 +337,18 @@ pub mod pallet {
 			});
 		}
 
+		fn append_or_replace_price(price: (u64, Permill)){
+			Prices::<T>::mutate(|prices|{
+				if prices.len() == 10 {
+					let _ = prices.pop_front();
+				}
+				prices.push_back(price);
+				log::info!("Price vector: {:?}", prices);
+			})
+		}
+
 		fn fetch_price_info() -> Result<(), Error<T>> {
 			// TODO: 这是你们的功课
-
 			// 利用 offchain worker 取出 DOT 当前对 USD 的价格，并把写到一个 Vec 的存储里，
 			// 你们自己选一种方法提交回链上，并在代码注释为什么用这种方法提交回链上最好。只保留当前最近的 10 个价格，
 			// 其他价格可丢弃 （就是 Vec 的长度长到 10 后，这时再插入一个值时，要先丢弃最早的那个值）。
@@ -316,12 +358,23 @@ pub mod pallet {
 
 			// 这个 http 请求可得到当前 DOT 价格：
 			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
+			
+		
+				match Self::fetch_n_parse_for_price() {
+					Ok(price_info) => {
+						log::info!("get price-info, {:?}", price_info);
+						Self::append_or_replace_price(price_info);
+						let signer = Signer::<T, T::AuthorityId>::any_account();
 
-			let s_info = StorageValueRef::persistent(b"offchain-demo::p-info");
-			if let Ok(Some(p_info)) = s_info.get::<>(){
-				log::info!("cached p-info: {:?}", p_info);
-				return Ok(());
-			}
+						let _ = signer.send_signed_transaction(|_acct|
+							// This is the on-chain function
+							Call::submit_price_signed(price_info)
+						  );
+						
+						
+					}
+					Err(err) => { return Err(err); }
+				}
 			
 			Ok(())
 		}
@@ -334,7 +387,7 @@ pub mod pallet {
 			// Create a reference to Local Storage value.
 			// Since the local storage is common for all offchain workers, it's a good practice
 			// to prepend our entry with the pallet name.
-			let s_info = StorageValueRef::persistent(b"offchain-demo::gh-info");
+		let s_info = StorageValueRef::persistent(b"offchain-demo::gh-info");
 
 			// Local storage is persisted and shared between runs of the offchain workers,
 			// offchain workers may run concurrently. We can use the `mutate` function to
@@ -375,6 +428,48 @@ pub mod pallet {
 			Ok(())
 		}
 
+
+		/// Fetch from remote and deserialize the JSON to a vecdeq
+		fn fetch_n_parse_for_price() -> Result<(u64, Permill), Error<T>> {
+			let resp_bytes = Self::fetch_from_remote_for_price().map_err(|e| {
+				log::error!("fetch_from_remote_for_price error: {:?}", e);
+				<Error<T>>::HttpFetchingError
+			})?;
+
+			
+			let resp_str:&str = str::from_utf8(&resp_bytes).unwrap_or("0");
+			// Print out our fetched JSON string
+			log::info!("In Fetch parse : {}", resp_str);
+
+			let v: serde_json::Value = serde_json::from_str(resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
+			//log::info!("In resp_str parse : {}", v);
+
+			let price_vec:Vec<u8> = v["data"]["priceUsd"].as_str().unwrap().as_bytes().to_vec();
+			log::info!("In price_vec parse : {:?}", price_vec);
+
+			let price_str = str::from_utf8(&price_vec).unwrap_or("0");
+			log::info!("In price_str parse : {:?}", price_str);
+
+			let price_str_to_vec: Vec<&str> = price_str.split(".").collect();
+			log::info!("In price_str_to_vec parse : {:?}", price_str_to_vec);
+
+			let num: u64 = price_str_to_vec[0].parse::<u64>().unwrap_or(0);
+
+			let mut float_num;
+			if price_str_to_vec[1].len() < 6 {
+				float_num = price_str_to_vec[1].parse().unwrap_or(0u32);
+				let mut i = 0;
+				while i<6-price_str_to_vec[1].len() {
+					float_num *= 10;
+					i += 1;
+				}
+			} else {
+				float_num = price_str_to_vec[1].get(0..6).unwrap().parse::<u32>().unwrap();
+			}
+			
+			Ok((num, Permill::from_parts(float_num)))
+		}
+
 		/// Fetch from remote and deserialize the JSON to a struct
 		fn fetch_n_parse() -> Result<GithubInfo, Error<T>> {
 			let resp_bytes = Self::fetch_from_remote().map_err(|e| {
@@ -384,13 +479,51 @@ pub mod pallet {
 
 			let resp_str = str::from_utf8(&resp_bytes).map_err(|_| <Error<T>>::HttpFetchingError)?;
 			// Print out our fetched JSON string
-			log::info!("{}", resp_str);
+			log::info!("In Fetch parse function: {}", resp_str);
 
 			// Deserializing JSON to struct, thanks to `serde` and `serde_derive`
-			let gh_info: GithubInfo =
+			let price_info: GithubInfo =
 			serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
-			Ok(gh_info)
+			Ok(price_info)
 		}
+
+
+		fn fetch_from_remote_for_price() -> Result<Vec<u8>, Error<T>> {
+			log::info!("sending request to: {}", HTTP_POLKADOT_REQUEST);
+
+			// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
+			let request = rt_offchain::http::Request::get(HTTP_POLKADOT_REQUEST);
+
+			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
+			let timeout = sp_io::offchain::timestamp()
+			.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+
+			// For github API request, we also need to specify `user-agent` in http request header.
+			//   See: https://developer.github.com/v3/#user-agent-required
+			let pending = request
+			.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
+				.deadline(timeout) // Setting the timeout time
+				.send() // Sending the request out by the host
+				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			// By default, the http request is async from the runtime perspective. So we are asking the
+			//   runtime to wait here.
+			// The returning value here is a `Result` of `Result`, so we are unwrapping it twice by two `?`
+			//   ref: https://substrate.dev/rustdocs/v2.0.0/sp_runtime/offchain/http/struct.PendingRequest.html#method.try_wait
+			let response = pending
+			.try_wait(timeout)
+			.map_err(|_| <Error<T>>::HttpFetchingError)?
+			.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			if response.code != 200 {
+				log::error!("Unexpected http request status code: {}", response.code);
+				return Err(<Error<T>>::HttpFetchingError);
+			}
+
+			// Next we fully read the response body and collect it to a vector of bytes.
+			Ok(response.body().collect::<Vec<u8>>())
+		}
+
 
 		/// This function uses the `offchain::http` API to query the remote github information,
 		///   and returns the JSON response as vector of bytes.

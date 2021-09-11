@@ -107,16 +107,8 @@ pub mod pallet {
 		blog: Vec<u8>,
 		public_repos: u32,
 	}
-	
-	struct PriceTmp{
 
-	}
-	#[derive(Deserialize, Encode, Decode, Default)]
-	struct PriceInfo {
-		#[serde(deserialize_with = "de_string_to_bytes")]
-		priceUsd: Vec<u8>,
-		
-	}
+	
 
 	#[derive(Debug, Deserialize, Encode, Decode, Default)]
 	struct IndexingData(Vec<u8>, u64);
@@ -127,18 +119,6 @@ pub mod pallet {
 	{
 		let s: &str = Deserialize::deserialize(de)?;
 		Ok(s.as_bytes().to_vec())
-	}
-	impl fmt::Debug for PriceInfo {
-		// `fmt` converts the vector of bytes inside the struct back to string for
-		//   more friendly display.
-		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-			write!(
-				f,
-				"{{ priceUsedL: {} }}",
-				str::from_utf8(&self.priceUsd).map_err(|_| fmt::Error)?,
-				
-				)
-		}
 	}
 
 	impl fmt::Debug for GithubInfo {
